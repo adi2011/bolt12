@@ -1,12 +1,16 @@
-#! /usr/bin/python3
-from typing import Tuple, Optional, Dict, Any, Sequence, Callable, List
-from io import BytesIO
+#! /usr/bin/env python3
+from typing import Tuple, Optional, Dict, Any, Sequence, List
 import bech32
-import generated
+from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
+from collections import namedtuple
 import hashlib
 import re
-from fundamentals import fromwire_bigsize, towire_bigsize
-from key import verify_schnorr, sign_schnorr
+import time
+from .fundamentals import fromwire_bigsize, towire_bigsize
+from .key import verify_schnorr, sign_schnorr
+from .generated import tlv_offer, tlv_invoice_request, tlv_invoice
+
 
 # BOLT #12:
 # All signatures are created as per
@@ -15,7 +19,8 @@ from key import verify_schnorr, sign_schnorr
 # SHA256(SHA256(`tag`) || SHA256(`tag`) || `msg`), and SIG(`tag`,`msg`,`key`)
 # as the signature of H(`tag`,`msg`) using `key`.
 
-def bolt12_h(tag: bytes, data: bytes = bytes()) -> 'hashlib.HASH':
+# FIXME: Returns hashlib.HASH?
+def bolt12_h(tag: bytes, data: bytes = bytes()) -> Any:
     tag_sha = hashlib.sha256(tag).digest()
     ret = hashlib.sha256(tag_sha + tag_sha)
     ret.update(data)
@@ -23,7 +28,7 @@ def bolt12_h(tag: bytes, data: bytes = bytes()) -> 'hashlib.HASH':
 
 
 # Table-driven tlv decoder
-def helper_fromwire_tlv(tlv_table: Dict[str, Tuple[str, Any, Any]],
+def helper_fromwire_tlv(tlv_table: Dict[int, Tuple[str, Any, Any]],
                         buffer: bytes) -> Tuple[Dict[str, Any], Dict[int, bytes]]:
     tlvs = {}
     unknowns = {}
@@ -53,8 +58,7 @@ def helper_fromwire_tlv(tlv_table: Dict[str, Tuple[str, Any, Any]],
     return tlvs, unknowns
 
 
-
-def tlv_ordered(tlv_table: Dict[str, Tuple[str, Any, Any]],
+def tlv_ordered(tlv_table: Dict[int, Tuple[str, Any, Any]],
                 tlvs: Dict[str, Any], unknowns: Dict[int, bytes],
                 exclude_sigs: bool = False) -> List[Tuple[int, bytes]]:
     """Marshall all entries into bytes, arrange in increasing order"""
@@ -84,9 +88,10 @@ def tlv_ordered(tlv_table: Dict[str, Tuple[str, Any, Any]],
 
 def tlv_enc(num: int, val: bytes) -> bytes:
     return towire_bigsize(num) + towire_bigsize(len(val)) + val
-    
+
+
 # Table-driven tlv encode
-def helper_towire_tlv(tlv_table: Dict[str, Tuple[str, Any, Any]],
+def helper_towire_tlv(tlv_table: Dict[int, Tuple[str, Any, Any]],
                       tlvs: Dict[str, Any],
                       unknowns: Dict[int, bytes]) -> bytes:
     buffer = bytes()
@@ -104,34 +109,191 @@ def simple_bech32_decode(bech32str: str) -> Tuple[str, bytes]:
 
     sep = bech32str.find('1')
     if sep == -1:
-        return None, None
+        raise ValueError("No separator found")
 
     hrp = bech32str[:sep]
     if not hrp.islower():
-        return None, None
+        raise ValueError("Mixed case found")
 
     ret5 = bytes()
-    for c in bech32str[sep+1:]:
+    for c in bech32str[sep + 1:]:
         pos = bech32.CHARSET.find(c)
         if pos == -1:
-            return None, None
+            raise ValueError("Invalid character '{}'".format(c))
         ret5 += bytes([pos])
-    return hrp, bytes(bech32.convertbits(ret5, 5, 8, False))
+
+    intarr = bech32.convertbits(ret5, 5, 8, False)
+    # Can't fail, since we ensured all values are 0-31 above!
+    assert intarr is not None
+    return hrp, bytes(intarr)
 
 
 def simple_bech32_encode(hrp: str, data: bytes) -> str:
     """Bech32 encode without a checksum"""
     encstr = hrp + '1'
-    for c in bech32.convertbits(data, 8, 5, True):
+    bits = bech32.convertbits(data, 8, 5, True)
+    assert bits is not None
+    for c in bits:
         encstr += bech32.CHARSET[c]
     return encstr
 
 
+class Recurrence(object):
+    """A class representing the period details for a recurring offer"""
+    Period = namedtuple('Period', ['start', 'end', 'paystart', 'payend'])
+
+    def __init__(self, recurrence, recurrence_paywindow=None, recurrence_limit=None, recurrence_base=None):
+        self.time_unit = recurrence['time_unit']
+        self.period = recurrence['period']
+
+        self.paywindow = recurrence_paywindow
+        self.limit = recurrence_limit
+        self.base = recurrence_base
+
+    def has_fixed_base(self) -> bool:
+        """Does this recurrence have a fixed base, or is it from first
+        invoice?"""
+        return self.base is not None
+
+    def can_start_offset(self) -> bool:
+        """Does this recurrence have a fixed base, and allows start at any
+period??"""
+        return self.has_fixed_base() and self.base['start_any_period']
+
+    @staticmethod
+    def _adjust_date(basedate, units, n, sameday):
+        while True:
+            ret = basedate + relativedelta(**{units: n})
+            if not sameday or ret.day == basedate.day:
+                return ret
+
+            # BOLT #12:
+            # - if the day is not within the month, use the last day within
+            #   the month.
+
+            # Try one day earlier as a base
+            basedate -= relativedelta(days=1)
+
+    def _get_period(self, n: int, basetime: int) -> 'Recurrence.Period':
+        """Return info on period n, ignoring limits"""
+        basedate = datetime.fromtimestamp(basetime, tz=timezone.utc)
+
+        # BOLT #12:
+        # 1. A `time_unit` defining 0 (seconds), 1 (days), 2 (months),
+        #    3 (years).
+        # 2. A `period`, defining how often (in `time_unit`) it has to be
+        #    paid.
+        if self.time_unit == 0:
+            units = 'seconds'
+            sameday = False
+        elif self.time_unit == 1:
+            units = 'days'
+            sameday = False
+        elif self.time_unit == 2:
+            units = 'months'
+            sameday = True
+        elif self.time_unit == 3:
+            units = 'years'
+            sameday = True
+
+        startdate = self._adjust_date(basedate, units, self.period * n, sameday)
+        enddate = self._adjust_date(startdate, units, self.period, sameday)
+
+        # Convert back to UNIX seconds
+        start = int(startdate.timestamp())
+        end = int(enddate.timestamp())
+
+        if self.paywindow is None:
+            # Default is that you can pay during previous period or this one.
+            paystartdate = self._adjust_date(startdate, units, -self.period,
+                                             sameday)
+            paystart = int(paystartdate.timestamp())
+            payend = end
+        else:
+            paystart = start - self.paywindow['seconds_before']
+            payend = start + self.paywindow['seconds_after']
+
+        # You can pay this between paystart and payend.
+        return Recurrence.Period(start, end, paystart, payend)
+
+    def get_period(self,
+                   n: int,
+                   basetime: int = int(time.time())) -> Optional['Recurrence.Period']:
+        """Return the (start,end,paystart,payend) of period n, using the
+        basetime given as first period start (unless has_fixed_base).
+        Returns None if that's past the limit.
+
+        The start,end reflect when the period is, and paystart,payend reflect
+        when you can pay for it.
+
+        """
+        if self.limit is not None and n > self.limit:
+            return None
+        if self.base is not None:
+            basetime = self.base['basetime']
+
+        return self._get_period(n, basetime)
+
+    def get_pay_factor(self, period: 'Recurrence.Period', time=int(time.time())):
+        """Returns factor by much your amount should be altered at time
+        seconds; normally returns 1, but if an offer sets
+        paywindow.proportional_amount, returns less than 1 if we're
+        already into the period.
+
+        """
+        # If there's no proportional payment, we pay full amount
+        if self.paywindow is None or not self.paywindow['proportional_amount']:
+            return 1
+        # Before period starts, we're good.
+        if time < period.start:
+            return 1
+        # This can happen in theory, if paywindow goes beyond end of period.
+        if time > period.end:
+            return 0
+        return (period.end - time) / (period.end - period.start)
+
+    def period_start_offset(self, when: int = int(time.time())):
+        """For a can_start_offset() Recurrence, what period does @when fall in?
+        Can return negtive if before start!
+        """
+        assert self.can_start_offset()
+
+        # Time is slippery!  Estimate using seconds, refine using exact
+        # calculations (which cover leap years, etc etc etc)
+        if self.time_unit == 0:
+            approx_mul = 1
+        elif self.time_unit == 1:
+            approx_mul = 24 * 60 * 60
+        elif self.time_unit == 2:
+            approx_mul = 30 * 24 * 60 * 60
+        elif self.time_unit == 3:
+            approx_mul = 365 * 30 * 24 * 60 * 60
+
+        period_num = ((when - self.base['basetime'])
+                      // (self.period * approx_mul))
+
+        while True:
+            period = self._get_period(period_num, self.base['basetime'])
+            if when < period.start:
+                period_num -= 1
+            elif when >= period.end:
+                period_num += 1
+            else:
+                return period_num
+
+
 class Bolt12(object):
-    def __init__(self, hrp: str, tlv_table: Dict[str, Tuple[str, Any, Any]], bytestr: bytes):
+    def __init__(self, hrp: str, tlv_table: Dict[int, Tuple[str, Any, Any]], bytestr: bytes):
         self.hrp = hrp
         self.tlv_table = tlv_table
         self.values, self.unknowns = helper_fromwire_tlv(tlv_table, bytestr)
+
+    def encode(self) -> str:
+        """Turn the BOLT12 object back into a bech32 string"""
+        return simple_bech32_encode(self.hrp,
+                                    helper_towire_tlv(self.tlv_table,
+                                                      self.values,
+                                                      self.unknowns))
 
     @staticmethod
     def create(hrp: str, bytestr: bytes):
@@ -144,8 +306,9 @@ class Bolt12(object):
 
         raise ValueError('Unknown human readable prefix {}'.format(hrp))
 
+    # FIXME: Returns 'hashlib.HASH'?
     @staticmethod
-    def lnall_ctx(tlv_ordered_nosigs: List[Tuple[int, bytes]]) -> 'hashlib.HASH':
+    def lnall_ctx(tlv_ordered_nosigs: List[Tuple[int, bytes]]) -> Any:
         # BOLT #12:
         # 2. The H(`LnAll`|all-tlvs,tlv) where "all-tlvs" consists of all non-signature TLV entries
         #    appended in ascending order.
@@ -226,12 +389,13 @@ class Bolt12(object):
         return sign_schnorr(privkey, hash)
 
     # BOLT #9:
-    # | 8/9   | `var_onion_optin` ... | IN9 |
-    # | 14/15 | `payment_secret` ... | IN9 |
+    # | 8/9   | `var_onion_optin` ... | IN9 |...
+    # | 14/15 | `payment_secret` ... | IN9 |...
     # | 16/17 | `basic_mpp` ... | IN9 |
     known_features = {8: 'var_onion_optin',
                       14: 'payment_secret',
                       16: 'basic_mpp'}
+
     @staticmethod
     def check_features(featureset: bytes) -> Optional[str]:
         """Returns None if OK, otherwise the complaint"""
@@ -242,7 +406,7 @@ class Bolt12(object):
         for i in range(0, len(featureset) * 8, 2):
             # Big-endian bitfields are the *worst*
             byte = int(featureset[len(featureset) - 1 - i // 8])
-            if byte & (1 << (i%8)) and i not in known_features:
+            if byte & (1 << (i % 8)) and i not in Bolt12.known_features:
                 return "Unsupported required feature {}".format(i)
         return None
 
@@ -250,7 +414,7 @@ class Bolt12(object):
 class Offer(Bolt12):
     """Class for an offer"""
     def __init__(self, hrp: str, bytestr: bytes):
-        super().__init__(hrp, generated.tlv_offer, bytestr)
+        super().__init__(hrp, tlv_offer, bytestr)
         self.offer_id = self.merkle()
 
     def check(self) -> Tuple[bool, str]:
@@ -294,17 +458,29 @@ class Offer(Bolt12):
         #  - FIXME: more!
         return True, ''
 
+    def get_recurrence(self) -> Optional[Recurrence]:
+        """If this offer recurs, returns the details.  Otherwise, None"""
+        # BOLT #12:
+        #   - MAY include `recurrence` to indicate offer should trigger
+        #     time-spaced invoices.
+        if 'recurrence' not in self.values:
+            return None
+        return Recurrence(self.values['recurrence'],
+                          self.values.get('recurrence_paywindow'),
+                          self.values.get('recurrence_limit'),
+                          self.values.get('recurrence_base'))
+
 
 class InvoiceRequest(Bolt12):
     """Class for an invoice_request"""
     def __init__(self, hrp: str, bytestr: bytes):
-        super().__init__(hrp, generated.tlv_invoice_request, bytestr)
+        super().__init__(hrp, tlv_invoice_request, bytestr)
 
 
 class Invoice(Bolt12):
     """Class for an invoice"""
     def __init__(self, hrp: str, bytestr: bytes):
-        super().__init__(hrp, generated.tlv_invoice, bytestr)
+        super().__init__(hrp, tlv_invoice, bytestr)
 
 
 class Decoder(object):
@@ -321,15 +497,21 @@ class Decoder(object):
         self.so_far += bech32str
         return self.complete()
 
-    def result(self) -> Tuple[Optional[Bolt12], str]:
-        """One string is complete(), try decoding"""
+    def raw_decode(self) -> Tuple[str, bytes]:
+        """One string is complete(), try converting to hrp, bytes"""
         assert self.complete()
         if self.so_far.startswith('+'):
-            return None, 'Missing a part?'
-        hrp, bytestr = simple_bech32_decode(re.sub(r'([A-Z0-9a-z])\+\s*([A-Z0-9a-z])', r'\1\2',
-                                                   self.so_far))
-        if bytestr is None:
-            return None, 'Invalid bech32 string'
+            raise ValueError("Missing a part?")
+
+        return simple_bech32_decode(re.sub(r'([A-Z0-9a-z])\+\s*([A-Z0-9a-z])', r'\1\2',
+                                           self.so_far))
+
+    def result(self) -> Tuple[Optional[Bolt12], str]:
+        """One string is complete(), try decoding"""
+        try:
+            hrp, bytestr = self.raw_decode()
+        except ValueError as e:
+            return None, ' '.join(e.args)
 
         try:
             ret = Bolt12.create(hrp, bytestr)
